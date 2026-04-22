@@ -2,9 +2,9 @@ import os
 import logging
 import asyncio
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,13 +14,17 @@ MORALIS_KEY = os.environ.get("MORALIS_KEY")
 HELIUS_KEY = os.environ.get("HELIUS_KEY")
 
 CHAINS = {
-    "bsc": {"name": "BSC", "emoji": "🟡", "moralis_chain": "0x38"},
-    "base": {"name": "Base", "emoji": "🔵", "moralis_chain": "0x2105"},
+    "bsc":      {"name": "BSC",      "emoji": "🟡", "moralis_chain": "0x38"},
+    "base":     {"name": "Base",     "emoji": "🔵", "moralis_chain": "0x2105"},
     "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "moralis_chain": "0xa4b1"},
+    "eth":      {"name": "Ethereum", "emoji": "⚪", "moralis_chain": "0x1"},
 }
 
-# Хранилище адресов (в памяти, сбрасывается при рестарте)
-user_wallets = {}  # {user_id: {"evm": [...], "solana": [...]}}
+STABLECOINS = {
+    "USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"
+}
+
+user_wallets = {}
 
 def get_user_wallets(user_id):
     if user_id not in user_wallets:
@@ -33,88 +37,112 @@ def is_solana_address(address):
 def is_evm_address(address):
     return address.startswith("0x") and len(address) == 42
 
-async def get_token_price_usd(token_address: str, chain: str) -> float:
-    """Получить цену токена в USD через Moralis"""
+async def get_swaps_for_wallet(wallet: str, chain: str, hours: int) -> list:
+    """Получить все свопы кошелька через Moralis"""
     try:
-        url = f"https://deep-index.moralis.io/api/v2.2/erc20/{token_address}/price"
-        headers = {"X-API-Key": MORALIS_KEY}
-        params = {"chain": CHAINS[chain]["moralis_chain"]}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return float(data.get("usdPrice", 0))
-    except:
-        pass
-    return 0.0
-
-async def get_evm_token_balance(wallet: str, token_address: str, chain: str) -> dict:
-    """Получить баланс ERC20 токена на EVM кошельке"""
-    try:
-        url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20"
+        url = f"https://deep-index.moralis.io/api/v2.2/wallets/{wallet}/swaps"
         headers = {"X-API-Key": MORALIS_KEY}
         params = {
             "chain": CHAINS[chain]["moralis_chain"],
-            "token_addresses[]": token_address
+            "limit": 50,
+            "order": "DESC"
         }
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data and len(data) > 0:
-                        token = data[0]
-                        decimals = int(token.get("decimals", 18))
-                        raw_balance = int(token.get("balance", 0))
-                        balance = raw_balance / (10 ** decimals)
-                        return {
-                            "balance": balance,
-                            "symbol": token.get("symbol", "???"),
-                            "name": token.get("name", "Unknown")
-                        }
+                    return data.get("result", [])
     except Exception as e:
-        logger.error(f"EVM balance error: {e}")
-    return {"balance": 0.0, "symbol": "???", "name": "Unknown"}
+        logger.error(f"Swaps error {wallet} {chain}: {e}")
+    return []
 
-async def get_solana_token_balance(wallet: str, token_mint: str) -> dict:
-    """Получить баланс SPL токена на Solana кошельке"""
+async def get_erc20_transfers(wallet: str, chain: str, hours: int) -> list:
+    """Получить ERC20 transfers через Moralis как fallback"""
     try:
-        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                wallet,
-                {"mint": token_mint},
-                {"encoding": "jsonParsed"}
-            ]
+        from datetime import timedelta
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20/transfers"
+        headers = {"X-API-Key": MORALIS_KEY}
+        params = {
+            "chain": CHAINS[chain]["moralis_chain"],
+            "limit": 100,
+            "order": "DESC",
+            "from_date": since.strftime("%Y-%m-%dT%H:%M:%SZ")
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
+            async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    accounts = data.get("result", {}).get("value", [])
-                    if accounts:
-                        info = accounts[0]["account"]["data"]["parsed"]["info"]
-                        amount = float(info["tokenAmount"]["uiAmount"] or 0)
-                        return {"balance": amount, "symbol": "SPL", "name": "Solana Token"}
+                    return data.get("result", [])
     except Exception as e:
-        logger.error(f"Solana balance error: {e}")
-    return {"balance": 0.0, "symbol": "SPL", "name": "Unknown"}
+        logger.error(f"Transfers error {wallet} {chain}: {e}")
+    return []
+
+def parse_swaps_from_transfers(transfers: list, wallet: str, hours: int) -> list:
+    """Парсим входящие стейблкоины как результат свопа"""
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    swaps = []
+    seen_tx = set()
+
+    for tx in transfers:
+        try:
+            # Только входящие переводы на наш кошелёк
+            to_addr = tx.get("to_address", "").lower()
+            if to_addr != wallet.lower():
+                continue
+
+            symbol = tx.get("token_symbol", "").upper()
+            if symbol not in STABLECOINS:
+                continue
+
+            # Проверяем время
+            block_time = tx.get("block_timestamp", "")
+            if block_time:
+                tx_time = datetime.fromisoformat(block_time.replace("Z", "+00:00"))
+                if tx_time < since:
+                    continue
+
+            tx_hash = tx.get("transaction_hash", "")
+            if tx_hash in seen_tx:
+                continue
+            seen_tx.add(tx_hash)
+
+            decimals = int(tx.get("token_decimals", 6))
+            raw_value = int(tx.get("value", 0))
+            amount = raw_value / (10 ** decimals)
+
+            if amount < 0.01:
+                continue
+
+            swaps.append({
+                "tx_hash": tx_hash,
+                "time": block_time,
+                "bought_symbol": symbol,
+                "bought_amount": amount,
+                "sold_symbol": "TOKEN",
+                "sold_amount": 0,
+                "wallet": wallet,
+            })
+        except Exception as e:
+            logger.error(f"Parse error: {e}")
+            continue
+
+    return swaps
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *OKX Boost Tracker*\n\n"
-        "Бот для массовой проверки балансов токенов по всем твоим кошелькам.\n\n"
+        "Отслеживает продажи токенов в USDT/USDC по всем кошелькам.\n\n"
         "*Команды:*\n"
         "➕ /addwallet `адрес` — добавить кошелёк\n"
-        "📋 /wallets — список всех кошельков\n"
-        "🗑 /clearwallets — очистить все кошельки\n"
-        "🔍 /check `адрес_токена` `сеть` — проверить балансы\n\n"
-        "*Сети:* `bsc` `base` `arbitrum` `solana`\n\n"
-        "*Пример:*\n"
-        "`/check 0xabc...123 bsc`\n"
-        "`/check So1ana...mint solana`"
+        "📋 /wallets — список кошельков\n"
+        "🗑 /clearwallets — очистить список\n"
+        "🔍 /scan `часы` — найти все свопы в USDT/USDC\n\n"
+        "*Примеры:*\n"
+        "`/scan 24` — свопы за последние 24 часа\n"
+        "`/scan 48` — за последние 2 дня\n"
+        "`/scan 168` — за последнюю неделю"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -123,34 +151,31 @@ async def addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallets = get_user_wallets(user_id)
 
     if not context.args:
-        await update.message.reply_text("❌ Укажи адрес кошелька.\nПример: `/addwallet 0x123...abc`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Укажи адрес.\nПример: `/addwallet 0x123...abc`", parse_mode="Markdown")
         return
 
     address = context.args[0].strip()
 
     if is_evm_address(address):
         if address.lower() in [w.lower() for w in wallets["evm"]]:
-            await update.message.reply_text("⚠️ Этот EVM кошелёк уже добавлен.")
+            await update.message.reply_text("⚠️ Уже добавлен.")
             return
         wallets["evm"].append(address)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ EVM кошелёк добавлен!\n📊 Всего кошельков: {total}")
-
+        await update.message.reply_text(f"✅ EVM кошелёк добавлен! Всего: {total}")
     elif is_solana_address(address):
         if address in wallets["solana"]:
-            await update.message.reply_text("⚠️ Этот Solana кошелёк уже добавлен.")
+            await update.message.reply_text("⚠️ Уже добавлен.")
             return
         wallets["solana"].append(address)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ Solana кошелёк добавлен!\n📊 Всего кошельков: {total}")
-
+        await update.message.reply_text(f"✅ Solana кошелёк добавлен! Всего: {total}")
     else:
-        await update.message.reply_text("❌ Адрес не распознан. Проверь правильность.")
+        await update.message.reply_text("❌ Адрес не распознан.")
 
 async def wallets_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallets = get_user_wallets(user_id)
-
     evm = wallets["evm"]
     sol = wallets["solana"]
 
@@ -175,136 +200,91 @@ async def clearwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_wallets[user_id] = {"evm": [], "solana": []}
     await update.message.reply_text("🗑 Все кошельки удалены.")
 
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallets = get_user_wallets(user_id)
 
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Укажи адрес токена и сеть.\n"
-            "Пример: `/check 0xabc...123 bsc`\n"
-            "Сети: `bsc` `base` `arbitrum` `solana`",
-            parse_mode="Markdown"
-        )
-        return
-
-    token_address = context.args[0].strip()
-    chain = context.args[1].strip().lower()
-
-    if chain not in CHAINS and chain != "solana":
-        await update.message.reply_text("❌ Неизвестная сеть. Используй: `bsc` `base` `arbitrum` `solana`", parse_mode="Markdown")
-        return
+    hours = 24
+    if context.args:
+        try:
+            hours = int(context.args[0])
+        except:
+            pass
 
     evm_wallets = wallets["evm"]
-    sol_wallets = wallets["solana"]
-
-    if chain == "solana" and not sol_wallets:
-        await update.message.reply_text("📭 Нет Solana кошельков. Добавь через /addwallet")
-        return
-
-    if chain in CHAINS and not evm_wallets:
+    if not evm_wallets:
         await update.message.reply_text("📭 Нет EVM кошельков. Добавь через /addwallet")
         return
 
-    msg = await update.message.reply_text("⏳ Проверяю балансы по всем кошелькам...")
+    msg = await update.message.reply_text(
+        f"⏳ Сканирую {len(evm_wallets)} кошельков за последние {hours}ч...\nЭто может занять 30-60 секунд."
+    )
 
-    results = []
-    token_symbol = "???"
-    total_balance = 0.0
+    all_swaps = []
+    total_usdt = 0.0
+    total_usdc = 0.0
 
-    if chain in CHAINS:
-        # Получаем цену токена
-        price_usd = await get_token_price_usd(token_address, chain)
-        chain_info = CHAINS[chain]
+    for wallet in evm_wallets:
+        for chain in CHAINS:
+            transfers = await get_erc20_transfers(wallet, chain, hours)
+            swaps = parse_swaps_from_transfers(transfers, wallet, hours)
+            for s in swaps:
+                s["chain"] = chain
+                all_swaps.append(s)
+                if s["bought_symbol"] == "USDT":
+                    total_usdt += s["bought_amount"]
+                elif s["bought_symbol"] == "USDC":
+                    total_usdc += s["bought_amount"]
 
-        tasks = [get_evm_token_balance(w, token_address, chain) for w in evm_wallets]
-        balances = await asyncio.gather(*tasks)
-
-        for wallet, bal_data in zip(evm_wallets, balances):
-            if bal_data["balance"] > 0:
-                token_symbol = bal_data["symbol"]
-                total_balance += bal_data["balance"]
-                usd_value = bal_data["balance"] * price_usd
-                results.append({
-                    "wallet": wallet,
-                    "balance": bal_data["balance"],
-                    "usd": usd_value,
-                    "symbol": bal_data["symbol"]
-                })
-
-        # Формируем ответ
-        chain_emoji = chain_info["emoji"]
-        chain_name = chain_info["name"]
-        text = f"{chain_emoji} *{chain_name} — {token_symbol}*\n"
-        text += f"`{token_address[:10]}...{token_address[-8:]}`\n"
-        if price_usd > 0:
-            text += f"💲 Цена: ${price_usd:.6f}\n"
-        text += "━━━━━━━━━━━━━━━━━━━━\n"
-
-        if not results:
-            text += "😶 Баланс 0 на всех кошельках\n"
-        else:
-            for r in results:
-                w = r["wallet"]
-                short = f"{w[:6]}...{w[-4:]}"
-                text += f"💼 `{short}` → *{r['balance']:.4f}* {r['symbol']}"
-                if r["usd"] > 0:
-                    text += f" (≈${r['usd']:.2f})"
-                text += "\n"
-
-        text += "━━━━━━━━━━━━━━━━━━━━\n"
-        text += f"📦 *Итого:* {total_balance:.4f} {token_symbol}\n"
-        if price_usd > 0:
-            text += f"💵 *В USD:* ≈${total_balance * price_usd:.2f}\n"
-
-        text += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-
-    elif chain == "solana":
-        tasks = [get_solana_token_balance(w, token_address) for w in sol_wallets]
-        balances = await asyncio.gather(*tasks)
-
-        text = f"◎ *Solana — SPL Token*\n"
-        text += f"`{token_address[:10]}...{token_address[-8:]}`\n"
-        text += "━━━━━━━━━━━━━━━━━━━━\n"
-
-        for wallet, bal_data in zip(sol_wallets, balances):
-            if bal_data["balance"] > 0:
-                total_balance += bal_data["balance"]
-                w = wallet
-                short = f"{w[:6]}...{w[-4:]}"
-                text += f"💼 `{short}` → *{bal_data['balance']:.4f}* SPL\n"
-
-        if total_balance == 0:
-            text += "😶 Баланс 0 на всех кошельках\n"
-
-        text += "━━━━━━━━━━━━━━━━━━━━\n"
-        text += f"📦 *Итого:* {total_balance:.4f}\n"
-        text += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-
-    # Кнопка для копирования в Excel
-    keyboard = [[InlineKeyboardButton("📊 Строка для Excel", callback_data=f"excel_{chain}_{token_address}_{total_balance:.4f}_{token_symbol}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await msg.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-
-async def excel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("_", 4)
-    if len(parts) < 5:
+    if not all_swaps:
+        await msg.edit_text(
+            f"😶 За последние {hours}ч свопов в USDT/USDC не найдено.\n\n"
+            f"Проверь что кошельки добавлены верно: /wallets"
+        )
         return
 
-    _, chain, token_addr, total, symbol = parts
-    date_str = datetime.now().strftime("%d.%m.%Y")
+    # Сортируем по времени
+    all_swaps.sort(key=lambda x: x["time"], reverse=True)
 
-    text = (
-        f"📊 *Строка для Excel:*\n\n"
-        f"`{date_str}\t{symbol}\t{total}\t\t\t\t`\n\n"
-        f"Скопируй и вставь в таблицу.\n"
-        f"Заполни: цену, сумму USDT, биржу, примечание."
-    )
-    await query.message.reply_text(text, parse_mode="Markdown")
+    text = f"📊 *Свопы в USDT/USDC за {hours}ч*\n"
+    text += f"🔍 Кошельков: {len(evm_wallets)}\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for s in all_swaps:
+        chain_info = CHAINS[s["chain"]]
+        w = s["wallet"]
+        short_w = f"{w[:6]}...{w[-4:]}"
+
+        try:
+            dt = datetime.fromisoformat(s["time"].replace("Z", "+00:00"))
+            time_str = dt.strftime("%d.%m %H:%M")
+        except:
+            time_str = "—"
+
+        text += f"{chain_info['emoji']} `{short_w}`\n"
+        text += f"📅 {time_str} | +*{s['bought_amount']:.2f} {s['bought_symbol']}*\n"
+        text += f"🔗 `{s['tx_hash'][:16]}...`\n\n"
+
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    if total_usdt > 0:
+        text += f"💚 Итого USDT: *{total_usdt:.2f}*\n"
+    if total_usdc > 0:
+        text += f"🔵 Итого USDC: *{total_usdc:.2f}*\n"
+    text += f"💰 Всего стейблов: *{total_usdt + total_usdc:.2f}*\n\n"
+    text += "📋 *Для Excel:*\n"
+    text += f"`Дата\tКошелёк\tТокен\tСумма USDT/USDC`\n"
+
+    for s in all_swaps:
+        w = s["wallet"]
+        short_w = f"{w[:6]}...{w[-4:]}"
+        try:
+            dt = datetime.fromisoformat(s["time"].replace("Z", "+00:00"))
+            date_str = dt.strftime("%d.%m.%Y")
+        except:
+            date_str = "—"
+        text += f"`{date_str}\t{short_w}\t{s['bought_symbol']}\t{s['bought_amount']:.2f}`\n"
+
+    await msg.edit_text(text, parse_mode="Markdown")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -312,8 +292,7 @@ def main():
     app.add_handler(CommandHandler("addwallet", addwallet))
     app.add_handler(CommandHandler("wallets", wallets_list))
     app.add_handler(CommandHandler("clearwallets", clearwallets))
-    app.add_handler(CommandHandler("check", check))
-    app.add_handler(CallbackQueryHandler(excel_callback, pattern="^excel_"))
+    app.add_handler(CommandHandler("scan", scan))
     logger.info("Bot started!")
     app.run_polling()
 
