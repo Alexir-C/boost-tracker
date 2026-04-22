@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import asyncio
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from telegram import Update
@@ -24,8 +23,6 @@ CHAINS = {
 }
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"}
-
-# ─── Работа с файлом ───────────────────────────────────────────────────────────
 
 def load_wallets() -> dict:
     if os.path.exists(WALLETS_FILE):
@@ -53,15 +50,11 @@ def update_user_wallets(user_id: int, wallets: dict):
     data[str(user_id)] = wallets
     save_wallets(data)
 
-# ─── Утилиты ──────────────────────────────────────────────────────────────────
-
 def is_evm_address(address: str) -> bool:
     return address.startswith("0x") and len(address) == 42
 
 def is_solana_address(address: str) -> bool:
     return len(address) >= 32 and len(address) <= 44 and not address.startswith("0x")
-
-# ─── API ──────────────────────────────────────────────────────────────────────
 
 async def get_erc20_transfers(wallet: str, chain: str, hours: int) -> list:
     try:
@@ -129,22 +122,20 @@ def parse_swaps_from_transfers(transfers: list, wallet: str, hours: int) -> list
 
     return swaps
 
-# ─── Команды ──────────────────────────────────────────────────────────────────
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *OKX Boost Tracker*\n\n"
         "Отслеживает продажи токенов в USDT/USDC по всем кошелькам.\n\n"
         "*Команды:*\n"
-        "➕ /addwallet `адрес` — добавить кошелёк\n"
+        "➕ /addwallet `адрес` — добавить один кошелёк\n"
+        "➕➕ /addmany — добавить много кошельков сразу\n"
         "📋 /wallets — список кошельков\n"
-        "🗑 /clearwallets — очистить список\n"
-        "❌ /removewallet `адрес` — удалить один кошелёк\n"
-        "🔍 /scan `часы` — найти все свопы в USDT/USDC\n\n"
+        "❌ /removewallet `адрес` — удалить кошелёк\n"
+        "🗑 /clearwallets — очистить всё\n"
+        "🔍 /scan `часы` — найти свопы в USDT/USDC\n\n"
         "*Примеры:*\n"
-        "`/scan 24` — за последние 24 часа\n"
-        "`/scan 48` — за последние 2 дня\n"
-        "`/scan 168` — за последнюю неделю"
+        "`/scan 24` — за 24 часа\n"
+        "`/scan 168` — за неделю"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -163,24 +154,63 @@ async def addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_evm_address(address):
         if address.lower() in [w.lower() for w in wallets["evm"]]:
-            await update.message.reply_text("⚠️ Этот кошелёк уже добавлен.")
+            await update.message.reply_text("⚠️ Уже добавлен.")
             return
         wallets["evm"].append(address)
         update_user_wallets(user_id, wallets)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ EVM кошелёк добавлен!\n📊 Всего кошельков: *{total}*", parse_mode="Markdown")
-
+        await update.message.reply_text(f"✅ EVM кошелёк добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
     elif is_solana_address(address):
         if address in wallets["solana"]:
-            await update.message.reply_text("⚠️ Этот кошелёк уже добавлен.")
+            await update.message.reply_text("⚠️ Уже добавлен.")
             return
         wallets["solana"].append(address)
         update_user_wallets(user_id, wallets)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ Solana кошелёк добавлен!\n📊 Всего кошельков: *{total}*", parse_mode="Markdown")
-
+        await update.message.reply_text(f"✅ Solana кошелёк добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Адрес не распознан. Проверь правильность.")
+        await update.message.reply_text("❌ Адрес не распознан.")
+
+async def addmany(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    wallets = get_user_wallets(user_id)
+
+    text = update.message.text
+    lines = text.split("\n")[1:]
+    addresses = [line.strip() for line in lines if line.strip()]
+
+    if not addresses:
+        await update.message.reply_text(
+            "❌ Укажи адреса каждый на новой строке:\n\n"
+            "`/addmany\n0x111...aaa\n0x222...bbb\n0x333...ccc`",
+            parse_mode="Markdown"
+        )
+        return
+
+    added = 0
+    skipped = 0
+    for address in addresses:
+        if is_evm_address(address):
+            if address.lower() not in [w.lower() for w in wallets["evm"]]:
+                wallets["evm"].append(address)
+                added += 1
+            else:
+                skipped += 1
+        elif is_solana_address(address):
+            if address not in wallets["solana"]:
+                wallets["solana"].append(address)
+                added += 1
+            else:
+                skipped += 1
+
+    update_user_wallets(user_id, wallets)
+    total = len(wallets["evm"]) + len(wallets["solana"])
+    await update.message.reply_text(
+        f"✅ Добавлено: *{added}*\n"
+        f"⚠️ Пропущено (дубли): *{skipped}*\n"
+        f"📊 Всего кошельков: *{total}*",
+        parse_mode="Markdown"
+    )
 
 async def removewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -209,9 +239,9 @@ async def removewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if removed:
         update_user_wallets(user_id, wallets)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ Кошелёк удалён.\n📊 Осталось: *{total}*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Удалён.\n📊 Осталось: *{total}*", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Такой кошелёк не найден в списке.")
+        await update.message.reply_text("❌ Такой кошелёк не найден.")
 
 async def wallets_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -220,7 +250,7 @@ async def wallets_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sol = wallets["solana"]
 
     if not evm and not sol:
-        await update.message.reply_text("📭 Кошельков нет. Добавь через /addwallet")
+        await update.message.reply_text("📭 Кошельков нет. Добавь через /addwallet или /addmany")
         return
 
     text = "📋 *Твои кошельки:*\n\n"
@@ -253,12 +283,12 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     evm_wallets = wallets["evm"]
     if not evm_wallets:
-        await update.message.reply_text("📭 Нет EVM кошельков. Добавь через /addwallet")
+        await update.message.reply_text("📭 Нет EVM кошельков. Добавь через /addmany")
         return
 
     msg = await update.message.reply_text(
-        f"⏳ Сканирую *{len(evm_wallets)}* кошельков за последние *{hours}ч*...\n"
-        f"Это может занять до 60 секунд.",
+        f"⏳ Сканирую *{len(evm_wallets)}* кошельков за *{hours}ч*...\n"
+        f"Подожди до 60 секунд.",
         parse_mode="Markdown"
     )
 
@@ -280,16 +310,15 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not all_swaps:
         await msg.edit_text(
-            f"😶 За последние {hours}ч свопов в USDT/USDC не найдено.\n\n"
-            f"Проверь что кошельки добавлены верно: /wallets"
+            f"😶 За последние {hours}ч свопов в USDT/USDC не найдено.\n"
+            f"Проверь кошельки: /wallets"
         )
         return
 
     all_swaps.sort(key=lambda x: x["time"], reverse=True)
 
     text = f"📊 *Свопы в USDT/USDC за {hours}ч*\n"
-    text += f"🔍 Кошельков проверено: {len(evm_wallets)}\n"
-    text += f"📝 Найдено транзакций: {len(all_swaps)}\n"
+    text += f"🔍 Кошельков: {len(evm_wallets)} | Транзакций: {len(all_swaps)}\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for s in all_swaps:
@@ -299,24 +328,20 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             dt = datetime.fromisoformat(s["time"].replace("Z", "+00:00"))
             time_str = dt.strftime("%d.%m %H:%M")
-            date_str = dt.strftime("%d.%m.%Y")
         except:
             time_str = "—"
-            date_str = "—"
-
         text += f"{chain_info['emoji']} `{short_w}` | {time_str}\n"
         text += f"💰 +*{s['bought_amount']:.2f} {s['bought_symbol']}*\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     if total_usdt > 0:
-        text += f"💚 Итого USDT: *{total_usdt:.2f}*\n"
+        text += f"💚 USDT: *{total_usdt:.2f}*\n"
     if total_usdc > 0:
-        text += f"🔵 Итого USDC: *{total_usdc:.2f}*\n"
+        text += f"🔵 USDC: *{total_usdc:.2f}*\n"
     text += f"💰 *Всего: {total_usdt + total_usdc:.2f}*\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     text += "📋 *Копируй в Excel:*\n"
-    text += "`Дата        Кошелёк          Сумма  Токен`\n"
     for s in all_swaps:
         w = s["wallet"]
         short_w = f"{w[:6]}...{w[-4:]}"
@@ -329,12 +354,11 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(text, parse_mode="Markdown")
 
-# ─── Запуск ───────────────────────────────────────────────────────────────────
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addwallet", addwallet))
+    app.add_handler(CommandHandler("addmany", addmany))
     app.add_handler(CommandHandler("removewallet", removewallet))
     app.add_handler(CommandHandler("wallets", wallets_list))
     app.add_handler(CommandHandler("clearwallets", clearwallets))
