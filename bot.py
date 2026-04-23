@@ -24,20 +24,20 @@ CHAINS = {
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"}
 
-def load_wallets() -> dict:
-    if os.path.exists("wallets.json"):
+def load_wallets():
+    if os.path.exists(WALLETS_FILE):
         try:
-            with open("wallets.json", "r") as f:
+            with open(WALLETS_FILE, "r") as f:
                 return json.load(f)
         except:
             pass
     return {}
 
-def save_wallets(data: dict):
-    with open("wallets.json", "w") as f:
+def save_wallets(data):
+    with open(WALLETS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def get_user_wallets(user_id: int) -> dict:
+def get_user_wallets(user_id):
     data = load_wallets()
     uid = str(user_id)
     if uid not in data:
@@ -45,19 +45,18 @@ def get_user_wallets(user_id: int) -> dict:
         save_wallets(data)
     return data[uid]
 
-def update_user_wallets(user_id: int, wallets: dict):
+def update_user_wallets(user_id, wallets):
     data = load_wallets()
     data[str(user_id)] = wallets
     save_wallets(data)
 
-def is_evm_address(address: str) -> bool:
+def is_evm_address(address):
     return address.startswith("0x") and len(address) == 42
 
-def is_solana_address(address: str) -> bool:
+def is_solana_address(address):
     return len(address) >= 32 and len(address) <= 44 and not address.startswith("0x")
 
-async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
-    """Получить ERC20 transfers через Etherscan API V2"""
+async def get_token_transfers(wallet, chain, hours):
     try:
         since_ts = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
         url = "https://api.etherscan.io/v2/api"
@@ -75,51 +74,41 @@ async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
             async with session.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    logger.info(f"Chain {chain['name']} wallet {wallet[:8]} status={data.get('status')} msg={data.get('message')} count={len(data.get('result', []) if isinstance(data.get('result'), list) else [])}")
                     if data.get("status") == "1":
                         result = data.get("result", [])
-                        filtered = [
-                            tx for tx in result
-                            if int(tx.get("timeStamp", 0)) >= since_ts
-                        ]
+                        filtered = [tx for tx in result if int(tx.get("timeStamp", 0)) >= since_ts]
                         return filtered
                     elif data.get("message") == "No transactions found":
                         return []
                     else:
-                        logger.error(f"API error: {data.get('message')} {data.get('result')}")
+                        logger.error(f"API error: {data.get('message')} | {data.get('result')}")
     except Exception as e:
         logger.error(f"Fetch error {wallet} {chain['name']}: {e}")
     return []
 
-def find_stable_received(transfers: list, wallet: str) -> list:
-    """Находим входящие стейблкоины"""
+def find_stable_received(transfers, wallet):
     results = []
     seen = set()
-
     for tx in transfers:
         try:
             to_addr = tx.get("to", "").lower()
             if to_addr != wallet.lower():
                 continue
-
             symbol = tx.get("tokenSymbol", "").upper()
             if symbol not in STABLECOINS:
                 continue
-
             tx_hash = tx.get("hash", "")
             if tx_hash in seen:
                 continue
             seen.add(tx_hash)
-
             decimals = int(tx.get("tokenDecimal", 6))
             raw_value = int(tx.get("value", 0))
             amount = raw_value / (10 ** decimals)
-
             if amount < 0.01:
                 continue
-
             timestamp = int(tx.get("timeStamp", 0))
             dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
             results.append({
                 "tx_hash": tx_hash,
                 "time": dt.isoformat(),
@@ -130,7 +119,6 @@ def find_stable_received(transfers: list, wallet: str) -> list:
         except Exception as e:
             logger.error(f"Parse error: {e}")
             continue
-
     return results
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -261,27 +249,22 @@ async def clearwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallets = get_user_wallets(user_id)
-
     hours = 24
     if context.args:
         try:
             hours = int(context.args[0])
         except:
             pass
-
     evm_wallets = wallets["evm"]
     if not evm_wallets:
         await update.message.reply_text("📭 Нет EVM кошельков. Добавь через /addmany")
         return
-
     msg = await update.message.reply_text(
         f"⏳ Сканирую *{len(evm_wallets)}* кошельков за *{hours}ч*...\nПодожди.",
         parse_mode="Markdown"
     )
-
     all_results = []
     total_by_stable = {}
-
     for wallet in evm_wallets:
         for chain_key, chain_info in CHAINS.items():
             transfers = await get_token_transfers(wallet, chain_info, hours)
@@ -291,20 +274,16 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 all_results.append(item)
                 sym = item["symbol"]
                 total_by_stable[sym] = total_by_stable.get(sym, 0) + item["amount"]
-
     if not all_results:
         await msg.edit_text(
             f"😶 За последние {hours}ч поступлений USDT/USDC не найдено.\n"
             f"Проверь кошельки: /wallets"
         )
         return
-
     all_results.sort(key=lambda x: x["time"], reverse=True)
-
     text = f"📊 *Поступления USDT/USDC за {hours}ч*\n"
     text += f"🔍 Кошельков: {len(evm_wallets)} | Транзакций: {len(all_results)}\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-
     for s in all_results:
         chain_info = CHAINS[s["chain"]]
         w = s["wallet"]
@@ -316,13 +295,11 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_str = "—"
         text += f"{chain_info['emoji']} `{short_w}` | {time_str}\n"
         text += f"💰 +*{s['amount']:.2f} {s['symbol']}*\n\n"
-
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     for sym, total in total_by_stable.items():
         text += f"*{sym}:* {total:.2f}\n"
     grand_total = sum(total_by_stable.values())
     text += f"💰 *Всего: {grand_total:.2f}*\n\n"
-
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     text += "📋 *Копируй в Excel:*\n"
     for s in all_results:
@@ -334,7 +311,6 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             date_str = "—"
         text += f"`{date_str}  {short_w}  {s['amount']:.2f}  {s['symbol']}`\n"
-
     await msg.edit_text(text, parse_mode="Markdown")
 
 def main():
