@@ -16,10 +16,10 @@ HELIUS_KEY = os.environ.get("HELIUS_KEY")
 WALLETS_FILE = "wallets.json"
 
 CHAINS = {
-    "bsc":      {"name": "BSC",      "emoji": "🟡", "chainid": "56"},
-    "base":     {"name": "Base",     "emoji": "🔵", "chainid": "8453"},
-    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "chainid": "42161"},
-    "eth":      {"name": "Ethereum", "emoji": "⚪", "chainid": "1"},
+    "bsc":      {"name": "BSC",      "emoji": "🟡", "moralis": "0x38"},
+    "base":     {"name": "Base",     "emoji": "🔵", "moralis": "0x2105"},
+    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "moralis": "0xa4b1"},
+    "eth":      {"name": "Ethereum", "emoji": "⚪", "moralis": "0x1"},
 }
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"}
@@ -59,32 +59,22 @@ def is_solana_address(address):
 async def get_token_transfers(wallet, chain, hours):
     try:
         since_ts = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
-        url = "https://api.etherscan.io/v2/api"
+        since_str = datetime.fromtimestamp(since_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20/transfers"
+        headers = {"X-API-Key": os.environ.get("MORALIS_KEY")}
         params = {
-            "chainid": chain["chainid"],
-            "module": "account",
-            "action": "tokentx",
-            "address": wallet,
-            "startblock": 0,
-            "endblock": 99999999,
-            "sort": "desc",
-            "apikey": ETHERSCAN_KEY,
+            "chain": chain["moralis"],
+            "limit": 100,
+            "from_date": since_str,
         }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Chain {chain['name']} wallet {wallet[:8]} status={data.get('status')} msg={data.get('message')} count={len(data.get('result', []) if isinstance(data.get('result'), list) else [])}")
-                    if data.get("status") == "1":
-                        result = data.get("result", [])
-                        filtered = [tx for tx in result if int(tx.get("timeStamp", 0)) >= since_ts]
-                        return filtered
-                    elif data.get("message") == "No transactions found":
-                        return []
-                    else:
-                        logger.error(f"API error: {data.get('message')} | {data.get('result')}")
+            async with session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
+                result = data.get("result", [])
+                logger.info(f"Moralis {chain['name']} {wallet[:8]} status={resp.status} count={len(result)}")
+                return result
     except Exception as e:
-        logger.error(f"Fetch error {wallet} {chain['name']}: {e}")
+        logger.error(f"Moralis error {wallet} {chain['name']}: {e}")
     return []
 
 def find_stable_received(transfers, wallet):
