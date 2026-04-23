@@ -10,47 +10,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MORALIS_KEY = os.environ.get("MORALIS_KEY")
+ETHERSCAN_KEY = os.environ.get("ETHERSCAN_KEY")
 HELIUS_KEY = os.environ.get("HELIUS_KEY")
 
 WALLETS_FILE = "wallets.json"
 
 CHAINS = {
-    "bsc":      {"name": "BSC",      "emoji": "🟡", "moralis_chain": "0x38"},
-    "base":     {"name": "Base",     "emoji": "🔵", "moralis_chain": "0x2105"},
-    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "moralis_chain": "0xa4b1"},
-    "eth":      {"name": "Ethereum", "emoji": "⚪", "moralis_chain": "0x1"},
+    "bsc":      {"name": "BSC",      "emoji": "🟡", "chain_id": "56",        "api": "https://api.bscscan.com/api"},
+    "base":     {"name": "Base",     "emoji": "🔵", "chain_id": "8453",      "api": "https://api.basescan.org/api"},
+    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "chain_id": "42161",     "api": "https://api.arbiscan.io/api"},
+    "eth":      {"name": "Ethereum", "emoji": "⚪", "chain_id": "1",         "api": "https://api.etherscan.io/api"},
 }
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"}
 
-# Контрактные адреса USDT/USDC на разных сетях
-STABLE_CONTRACTS = {
-    # BSC
-    "0x55d398326f99059ff775485246999027b3197955": ("USDT", "bsc"),
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": ("USDC", "bsc"),
-    # Base
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": ("USDC", "base"),
-    "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2": ("USDT", "base"),
-    # Arbitrum
-    "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": ("USDT", "arbitrum"),
-    "0xaf88d065e77c8cc2239327c5edb3a432268e5831": ("USDC", "arbitrum"),
-    # Ethereum
-    "0xdac17f958d2ee523a2206206994597c13d831ec7": ("USDT", "eth"),
-    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": ("USDC", "eth"),
-}
-
 def load_wallets() -> dict:
-    if os.path.exists(WALLETS_FILE):
+    if os.path.exists("wallets.json"):
         try:
-            with open(WALLETS_FILE, "r") as f:
+            with open("wallets.json", "r") as f:
                 return json.load(f)
         except:
             pass
     return {}
 
 def save_wallets(data: dict):
-    with open(WALLETS_FILE, "w") as f:
+    with open("wallets.json", "w") as f:
         json.dump(data, f, indent=2)
 
 def get_user_wallets(user_id: int) -> dict:
@@ -72,82 +56,75 @@ def is_evm_address(address: str) -> bool:
 def is_solana_address(address: str) -> bool:
     return len(address) >= 32 and len(address) <= 44 and not address.startswith("0x")
 
-async def get_wallet_token_transfers(wallet: str, chain_id: str, hours: int) -> list:
-    """Получить все ERC20 transfers через Moralis v2"""
+async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
+    """Получить ERC20 transfers через Etherscan API"""
     try:
-        since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20/transfers"
-        headers = {"X-API-Key": MORALIS_KEY}
+        since_ts = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
         params = {
-            "chain": chain_id,
-            "limit": 100,
-            "order": "DESC",
-            "from_date": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "module": "account",
+            "action": "tokentx",
+            "address": wallet,
+            "startblock": 0,
+            "endblock": 99999999,
+            "sort": "desc",
+            "apikey": ETHERSCAN_KEY,
         }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as resp:
+            async with session.get(chain["api"], params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("result", [])
-                else:
-                    text = await resp.text()
-                    logger.error(f"API error {resp.status}: {text[:200]}")
+                    if data.get("status") == "1":
+                        result = data.get("result", [])
+                        # Фильтруем по времени
+                        filtered = [
+                            tx for tx in result
+                            if int(tx.get("timeStamp", 0)) >= since_ts
+                        ]
+                        return filtered
+                    elif data.get("message") == "No transactions found":
+                        return []
+                    else:
+                        logger.error(f"API error: {data.get('message')}")
     except Exception as e:
-        logger.error(f"Transfer fetch error {wallet} {chain_id}: {e}")
+        logger.error(f"Fetch error {wallet} {chain['name']}: {e}")
     return []
 
-def find_stables_received(transfers: list, wallet: str, hours: int) -> list:
-    """Находим входящие стейблкоины по контрактным адресам"""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def find_stable_received(transfers: list, wallet: str) -> list:
+    """Находим входящие стейблкоины"""
     results = []
     seen = set()
 
     for tx in transfers:
         try:
-            to_addr = (tx.get("to_address") or "").lower()
+            to_addr = tx.get("to", "").lower()
             if to_addr != wallet.lower():
                 continue
 
-            contract = (tx.get("address") or "").lower()
-            symbol_upper = (tx.get("token_symbol") or "").upper()
-
-            # Проверяем по символу ИЛИ по контракту
-            is_stable = symbol_upper in STABLECOINS or contract in STABLE_CONTRACTS
-
-            if not is_stable:
+            symbol = tx.get("tokenSymbol", "").upper()
+            if symbol not in STABLECOINS:
                 continue
 
-            # Определяем символ
-            if symbol_upper in STABLECOINS:
-                symbol = symbol_upper
-            else:
-                symbol = STABLE_CONTRACTS.get(contract, ("STABLE", ""))[0]
-
-            block_time = tx.get("block_timestamp", "")
-            if block_time:
-                tx_time = datetime.fromisoformat(block_time.replace("Z", "+00:00"))
-                if tx_time < since:
-                    continue
-
-            tx_hash = tx.get("transaction_hash", "")
+            tx_hash = tx.get("hash", "")
             if tx_hash in seen:
                 continue
             seen.add(tx_hash)
 
-            decimals = int(tx.get("token_decimals") or 6)
-            raw_value = int(tx.get("value") or 0)
+            decimals = int(tx.get("tokenDecimal", 6))
+            raw_value = int(tx.get("value", 0))
             amount = raw_value / (10 ** decimals)
 
             if amount < 0.01:
                 continue
 
+            timestamp = int(tx.get("timeStamp", 0))
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
             results.append({
                 "tx_hash": tx_hash,
-                "time": block_time,
+                "time": dt.isoformat(),
                 "symbol": symbol,
                 "amount": amount,
                 "wallet": wallet,
-                "contract": contract,
             })
         except Exception as e:
             logger.error(f"Parse error: {e}")
@@ -186,7 +163,7 @@ async def addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallets["evm"].append(address)
         update_user_wallets(user_id, wallets)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ EVM кошелёк добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
     elif is_solana_address(address):
         if address in wallets["solana"]:
             await update.message.reply_text("⚠️ Уже добавлен.")
@@ -194,7 +171,7 @@ async def addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallets["solana"].append(address)
         update_user_wallets(user_id, wallets)
         total = len(wallets["evm"]) + len(wallets["solana"])
-        await update.message.reply_text(f"✅ Solana кошелёк добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Добавлен!\n📊 Всего: *{total}*", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Адрес не распознан.")
 
@@ -237,7 +214,7 @@ async def removewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallets = get_user_wallets(user_id)
     if not context.args:
-        await update.message.reply_text("❌ Укажи адрес.", parse_mode="Markdown")
+        await update.message.reply_text("❌ Укажи адрес.")
         return
     address = context.args[0].strip()
     removed = False
@@ -306,8 +283,8 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for wallet in evm_wallets:
         for chain_key, chain_info in CHAINS.items():
-            transfers = await get_wallet_token_transfers(wallet, chain_info["moralis_chain"], hours)
-            found = find_stables_received(transfers, wallet, hours)
+            transfers = await get_token_transfers(wallet, chain_info, hours)
+            found = find_stable_received(transfers, wallet)
             for item in found:
                 item["chain"] = chain_key
                 all_results.append(item)
@@ -332,12 +309,10 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w = s["wallet"]
         short_w = f"{w[:6]}...{w[-4:]}"
         try:
-            dt = datetime.fromisoformat(s["time"].replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(s["time"])
             time_str = dt.strftime("%d.%m %H:%M")
-            date_str = dt.strftime("%d.%m.%Y")
         except:
             time_str = "—"
-            date_str = "—"
         text += f"{chain_info['emoji']} `{short_w}` | {time_str}\n"
         text += f"💰 +*{s['amount']:.2f} {s['symbol']}*\n\n"
 
@@ -353,7 +328,7 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w = s["wallet"]
         short_w = f"{w[:6]}...{w[-4:]}"
         try:
-            dt = datetime.fromisoformat(s["time"].replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(s["time"])
             date_str = dt.strftime("%d.%m.%Y")
         except:
             date_str = "—"
