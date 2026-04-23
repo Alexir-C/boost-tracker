@@ -82,23 +82,24 @@ def find_stable_received(transfers, wallet):
     seen = set()
     for tx in transfers:
         try:
-            to_addr = tx.get("to", "").lower()
+            to_addr = tx.get("to_address", "").lower()
+            symbol = tx.get("token_symbol", "").upper()
+            logger.info(f"TX: to={to_addr[:8]} wallet={wallet[:8].lower()} symbol={symbol} match_to={to_addr == wallet.lower()} match_sym={symbol in STABLECOINS}")
             if to_addr != wallet.lower():
                 continue
-            symbol = tx.get("tokenSymbol", "").upper()
             if symbol not in STABLECOINS:
                 continue
-            tx_hash = tx.get("hash", "")
+            tx_hash = tx.get("transaction_hash", "")
             if tx_hash in seen:
                 continue
             seen.add(tx_hash)
-            decimals = int(tx.get("tokenDecimal", 6))
-            raw_value = int(tx.get("value", 0))
+            decimals = int(tx.get("token_decimals") or 6)
+            raw_value = int(tx.get("value") or 0)
             amount = raw_value / (10 ** decimals)
             if amount < 0.01:
                 continue
-            timestamp = int(tx.get("timeStamp", 0))
-            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            timestamp = tx.get("block_timestamp", "")
+            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             results.append({
                 "tx_hash": tx_hash,
                 "time": dt.isoformat(),
