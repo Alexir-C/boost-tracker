@@ -16,10 +16,10 @@ HELIUS_KEY = os.environ.get("HELIUS_KEY")
 WALLETS_FILE = "wallets.json"
 
 CHAINS = {
-    "bsc":      {"name": "BSC",      "emoji": "🟡", "chain_id": "56",        "api": "https://api.bscscan.com/api"},
-    "base":     {"name": "Base",     "emoji": "🔵", "chain_id": "8453",      "api": "https://api.basescan.org/api"},
-    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "chain_id": "42161",     "api": "https://api.arbiscan.io/api"},
-    "eth":      {"name": "Ethereum", "emoji": "⚪", "chain_id": "1",         "api": "https://api.etherscan.io/api"},
+    "bsc":      {"name": "BSC",      "emoji": "🟡", "chainid": "56"},
+    "base":     {"name": "Base",     "emoji": "🔵", "chainid": "8453"},
+    "arbitrum": {"name": "Arbitrum", "emoji": "🔷", "chainid": "42161"},
+    "eth":      {"name": "Ethereum", "emoji": "⚪", "chainid": "1"},
 }
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "USDE", "TUSD"}
@@ -57,10 +57,12 @@ def is_solana_address(address: str) -> bool:
     return len(address) >= 32 and len(address) <= 44 and not address.startswith("0x")
 
 async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
-    """Получить ERC20 transfers через Etherscan API"""
+    """Получить ERC20 transfers через Etherscan API V2"""
     try:
         since_ts = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        url = "https://api.etherscan.io/v2/api"
         params = {
+            "chainid": chain["chainid"],
             "module": "account",
             "action": "tokentx",
             "address": wallet,
@@ -70,12 +72,11 @@ async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
             "apikey": ETHERSCAN_KEY,
         }
         async with aiohttp.ClientSession() as session:
-            async with session.get(chain["api"], params=params) as resp:
+            async with session.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("status") == "1":
                         result = data.get("result", [])
-                        # Фильтруем по времени
                         filtered = [
                             tx for tx in result
                             if int(tx.get("timeStamp", 0)) >= since_ts
@@ -84,7 +85,7 @@ async def get_token_transfers(wallet: str, chain: dict, hours: int) -> list:
                     elif data.get("message") == "No transactions found":
                         return []
                     else:
-                        logger.error(f"API error: {data.get('message')}")
+                        logger.error(f"API error: {data.get('message')} {data.get('result')}")
     except Exception as e:
         logger.error(f"Fetch error {wallet} {chain['name']}: {e}")
     return []
